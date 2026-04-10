@@ -3,3 +3,4 @@ dataset*
 iam_data/
 .vscode
 *.pth
+custom/

@@ -1,86 +1,146 @@
 import streamlit as st
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image, ImageOps
-import numpy as np
 
-# Rebuild Vocab
-ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ "
-int_to_char = {i + 1: char for i, char in enumerate(ALPHABET)}
-NUM_CLASSES = len(ALPHABET) + 1
+# =====================================================
+# CHARACTER VOCAB
+# =====================================================
 
-# 1. Model Definition
-class HandwrittenWordReader(nn.Module):
-    def __init__(self, num_chars, hidden_size=256, num_layers=2):
-        super(HandwrittenWordReader, self).__init__()
+characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?'-\"():;#&/ "
+char_to_idx = {c: i + 1 for i, c in enumerate(characters)}
+idx_to_char = {i + 1: c for i, c in enumerate(characters)}
+BLANK_IDX = 0
+
+# =====================================================
+# MODEL
+# =====================================================
+
+class CRNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+
         self.cnn = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.MaxPool2d((2, 2), (2, 1), (0, 1))
+            nn.Conv2d(1, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d((2, 1))
         )
-        self.rnn = nn.LSTM(256 * 4, hidden_size, num_layers, bidirectional=True, batch_first=True)
-        self.fc = nn.Linear(hidden_size * 2, num_chars)
+
+        self.rnn = nn.LSTM(
+            input_size=256 * 4,
+            hidden_size=256,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True
+        )
+
+        self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        conv_out = self.cnn(x)
-        b, c, h, w = conv_out.size()
-        conv_out = conv_out.view(b, c * h, w).permute(0, 2, 1)
-        rnn_out, _ = self.rnn(conv_out)
-        return self.fc(rnn_out) # No log_softmax needed for greedy decoding
+        x = self.cnn(x)
 
-# 2. UI Setup
-st.set_page_config(page_title="Word Reader", page_icon="📝")
-st.title("📝 Handwritten Word Recognition")
+        b, c, h, w = x.size()
+
+        x = x.permute(0, 3, 1, 2)
+        x = x.contiguous().view(b, w, c * h)
+
+        x, _ = self.rnn(x)
+        x = self.fc(x)
+
+        return x
+
+# =====================================================
+# LOAD MODEL
+# =====================================================
 
 @st.cache_resource
 def load_model():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = HandwrittenWordReader(num_chars=NUM_CLASSES)
-    model.load_state_dict(torch.load('crnn_word_reader.pth', map_location=device))
-    model.to(device)
+    model = CRNN(num_classes=len(char_to_idx) + 1)
+    model.load_state_dict(torch.load("crnn_word_reader_final.pth", map_location="cpu"))
     model.eval()
-    return model, device
+    return model
 
-model, device = load_model()
+model = load_model()
 
-# 3. Inference
-uploaded_file = st.file_uploader("Upload a cropped WORD image...", type=["jpg", "png"])
+# =====================================================
+# IMAGE PREPROCESSING
+# =====================================================
 
-def decode_predictions(preds):
-    # Greedy decoding: pick the highest probability class at each timestep
-    _, max_indices = torch.max(preds, dim=-1)
-    max_indices = max_indices.squeeze(0).cpu().numpy()
-    
-    # Remove blanks (0) and consecutive duplicates (CTC rules)
-    decoded_text = []
-    prev_char = None
-    for idx in max_indices:
-        if idx != 0 and idx != prev_char:
-            decoded_text.append(int_to_char[idx])
-        prev_char = idx
-    return "".join(decoded_text)
+def preprocess_image(image):
+    image = image.convert('L')
+
+    new_w = int(image.size[0] * (32 / image.size[1]))
+    image = image.resize((new_w, 32))
+
+    if new_w < 128:
+        image = ImageOps.expand(image, border=(0, 0, 128 - new_w, 0), fill=255)
+    else:
+        image = image.crop((0, 0, 128, 32))
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+
+    image = transform(image)
+    image = image.unsqueeze(0)
+
+    return image
+
+# =====================================================
+# DECODER
+# =====================================================
+
+def decode_prediction(output):
+    output = output.argmax(2)
+    output = output[:, 0]
+
+    result = []
+    prev = -1
+
+    for p in output:
+        p = p.item()
+
+        if p != prev and p != BLANK_IDX:
+            result.append(idx_to_char.get(p, ''))
+
+        prev = p
+
+    return ''.join(result)
+
+# =====================================================
+# UI
+# =====================================================
+
+st.title("Handwritten Word Recognition")
+st.write("Upload a cropped handwritten word image")
+
+uploaded_file = st.file_uploader(
+    "Choose image",
+    type=["png", "jpg", "jpeg"]
+)
 
 if uploaded_file is not None:
-    im = Image.open(uploaded_file).convert('L')
-    st.image(im, caption="Uploaded Word", width=300)
-    
-    if st.button("Read Word"):
-        cur_width, cur_height = im.size
-        new_width = int(cur_width * (32 / cur_height))
-        im = im.resize((new_width, 32), Image.LANCZOS)
-        
-        if new_width < 128:
-            im = ImageOps.expand(im, (0, 0, 128 - new_width, 0), fill=255)
-        else:
-            im = im.crop((0, 0, 128, 32))
-            
-        img_tensor = transforms.ToTensor()(im).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            preds = model(img_tensor)
-            result = decode_predictions(preds)
-            
-        st.success(f"### 🎯 Predicted Text: **{result}**")
+    image = Image.open(uploaded_file)
+
+    st.image(image, caption="Uploaded Image", use_container_width=True)
+
+    processed = preprocess_image(image)
+
+    with torch.no_grad():
+        output = model(processed)
+        output = output.permute(1, 0, 2)
+
+        prediction = decode_prediction(output)
+
+    st.subheader("Prediction")
+    st.success(prediction)
